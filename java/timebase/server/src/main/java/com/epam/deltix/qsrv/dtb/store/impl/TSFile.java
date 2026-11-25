@@ -839,8 +839,13 @@ final class TSFile extends TSFolderEntry implements TimeSlice {
         root.getCache().fileDeactivated();
 
         if (dbs != null) {
-            for (int pos = 0, numEntities = dbs.size(); pos < numEntities; pos++)
-                dbs.getObjectNoRangeCheck(pos).clear();
+            for (int pos = 0, numEntities = dbs.size(); pos < numEntities; pos++) {
+                final DataBlockInfo db = dbs.getObjectNoRangeCheck(pos);
+                // Readers and writers check that the block is active and use its data under the lock of the block
+                synchronized (db) {
+                    db.clear();
+                }
+            }
             dbs.clear();
         }
 

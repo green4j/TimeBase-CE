@@ -133,7 +133,9 @@ public class DataWriterImpl extends BlockAccessorBase implements DataWriter {
                 continue;
             }
             
-            AccessorBlockLink   link = getBlockLink (entity, nstime);
+            // No forward(): insertMessage() seeks under the lock of the block it takes anyway, and the live
+            // readers of the entity contend for that lock on every message.
+            AccessorBlockLink   link = getBlockLink (entity);
             link.insertMessage (nstime, buffer.getBuffer (), 0, packetLength);
             break;
         }

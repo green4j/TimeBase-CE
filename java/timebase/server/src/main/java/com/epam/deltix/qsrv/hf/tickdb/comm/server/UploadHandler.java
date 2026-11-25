@@ -17,6 +17,7 @@
 package com.epam.deltix.qsrv.hf.tickdb.comm.server;
 
 import com.epam.deltix.data.stream.MessageDecoder;
+import com.epam.deltix.qsrv.dtb.store.dataacc.DeferredNotifications;
 import com.epam.deltix.qsrv.hf.tickdb.impl.ServerLock;
 import com.epam.deltix.qsrv.hf.tickdb.impl.TickLoaderWrapper;
 import com.epam.deltix.qsrv.hf.tickdb.pub.lock.*;
@@ -138,13 +139,27 @@ class UploadHandler extends QuickExecutor.QuickTask implements LockEventListener
 
     @Override
     public void         run () {
+        final DeferredNotifications notifications = DeferredNotifications.current();
+        notifications.begin();
+        long consumed = 0;  // bytes of messages taken off the channel by this run
+        long flushAt = -1;  // what had arrived when a wake-up was first deferred, as a consumed position
         try {
             loop: for (;;) {
                 if (ds.getState() == VSChannelState.Closed)
                     break;
 
-                if (in.available () == 0)
+                final int available = in.available ();
+                if (available == 0)
                     return;
+
+                // Wake-ups must not wait behind a call that may block (a network read, a flush or a close),
+                // nor for data that arrived after them.
+                if (available < MAX_HEADER_SIZE || (flushAt >= 0 && consumed >= flushAt)) {
+                    notifications.flush();
+                    flushAt = -1;
+                } else if (flushAt < 0 && notifications.hasPending()) {
+                    flushAt = consumed + available;
+                }
 
                 if (exclusiveLockError != null) {
                     TickDBServer.LOGGER.log (Level.WARNING, exclusiveLockError.getMessage());
@@ -166,6 +181,7 @@ class UploadHandler extends QuickExecutor.QuickTask implements LockEventListener
 
                 switch (size) {
                     case TDBProtocol.LOAD_CLOSE:  // Clean disconnect
+                        notifications.flush();
                         closeLoader();
 
                         synchronized (out) {
@@ -179,6 +195,7 @@ class UploadHandler extends QuickExecutor.QuickTask implements LockEventListener
                         break loop;
 
                     case TDBProtocol.LOAD_FLUSH:
+                        notifications.flush();
                         loader.flush();
 
                         synchronized (out) {
@@ -188,11 +205,19 @@ class UploadHandler extends QuickExecutor.QuickTask implements LockEventListener
                         break loop;
 
                     case TDBProtocol.LOAD_REMOVE:
+                        consumed += MessageSizeCodec.fieldSize (TDBProtocol.LOAD_REMOVE);
                         size = MessageSizeCodec.read (ds.getInputStream());
                         remove = true;
                         // we do not break - read message
                     default: {
                         byteBuffer.setSizeUnsafe (size);
+
+                        // readFully() would wait for the rest of the message from the network
+                        if (in.available () < size) {
+                            notifications.flush();
+                            flushAt = -1;
+                        }
+                        consumed += MessageSizeCodec.fieldSize (size) + size;
 
                         ds.getDataInputStream().readFully (byteBuffer.getInternalBuffer (), 0, size);
 
@@ -234,8 +259,13 @@ class UploadHandler extends QuickExecutor.QuickTask implements LockEventListener
             UserLogger.error(user, ds.getRemoteAddress(), ds.getRemoteApplication(), "[" + stream.getKey() + "]. Error while loading data.", iox);
             //TickDBServer.LOGGER.log (Level.SEVERE, "IOException on upload:", iox);
             closeAll();
+        } finally {
+            notifications.end();
         }
     }
+
+    // Two size prefixes of up to 3 bytes each (LOAD_REMOVE) and the first byte of the message.
+    private static final int MAX_HEADER_SIZE = 7;
 
     private void            closeLoader() {
         loader.removeEventListener (listener);

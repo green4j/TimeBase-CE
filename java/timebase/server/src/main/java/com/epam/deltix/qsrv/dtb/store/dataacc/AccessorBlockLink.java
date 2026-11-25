@@ -313,6 +313,11 @@ public final class AccessorBlockLink {
 
     int                         readMessageForward (TSMessageConsumer processor) {
         synchronized (block) {
+            // The block of a closed TSFile is not read. Checked under the lock the read takes anyway: the writer
+            // and every live reader of the entity take this lock per message, a separate isActive() is one more.
+            if (!block.isActive())
+                return NextState.NONE;
+
             MemoryDataInput     mdi = getMDI ();
 
             boolean             hasMore = mdi.hasAvail ();
@@ -339,6 +344,10 @@ public final class AccessorBlockLink {
 
     int                         readMessageReverse (TSMessageConsumer processor) {
         synchronized (block) {
+            // As in readMessageForward()
+            if (!block.isActive())
+                return NextState.NONE;
+
             MemoryDataInput     mdi = getMDI ();
 
             int result = mdi.hasAvail() ? NextState.HAS_CURRENT : NextState.NONE;

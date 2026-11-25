@@ -17,11 +17,8 @@
 package com.epam.deltix.qsrv.dtb.store.dataacc;
 
 import com.epam.deltix.qsrv.dtb.store.pub.*;
-import com.epam.deltix.util.collections.IntegerRingedList;
 import com.epam.deltix.util.collections.generated.IntegerEnumeration;
-import com.epam.deltix.util.collections.generated.IntegerToObjectHashMap;
 import com.epam.deltix.util.concurrent.*;
-import net.jcip.annotations.GuardedBy;
 
 /**
  *
@@ -38,14 +35,12 @@ public final class LiveDataReaderImpl
     private long                                limit = Long.MAX_VALUE; // limit timestamp
 
     // incoming updated blocks
-    private final IntegerToObjectHashMap<DataBlock> waiting = new IntegerToObjectHashMap<>();
-
-    // Keys of "waiting" map. Must be updated together with "waiting" map.
-    @GuardedBy("waiting")
-    private final IntegerRingedList             waitingList = new IntegerRingedList();
+    private final PendingBlocks                 waiting = new PendingBlocks();
 
     private volatile Runnable                   listener;
     private final QuickExecutor.QuickTask       notifier;
+
+    private final Runnable                      wakeUp;
 
     public LiveDataReaderImpl(QuickExecutor exe) {
         notifier = new QuickExecutor.QuickTask (exe) {
@@ -59,6 +54,19 @@ public final class LiveDataReaderImpl
                     synchronized (LiveDataReaderImpl.this) {
                         LiveDataReaderImpl.this.notifyAll();
                     }
+                }
+            }
+        };
+
+        // One instance per reader: DeferredNotifications drops a repeated submit of the same instance. Whether to
+        // wake the reader is decided when it runs, so a deferred wake-up the reader no longer needs is not sent.
+        wakeUp = () -> {
+            if (waiting.requestWake()) {
+                try {
+                    notifier.submit();
+                } catch (RuntimeException x) {
+                    waiting.cancelWake();
+                    throw x;
                 }
             }
         };
@@ -88,9 +96,7 @@ public final class LiveDataReaderImpl
         pq = null;
         currentTimestamp = Long.MAX_VALUE;
 
-        synchronized (waiting) {
-            clearWaiting();
-        }
+        waiting.clear();
 
         super.close ();
     }
@@ -237,6 +243,10 @@ public final class LiveDataReaderImpl
         if (processor.processRealTime(currentTimestamp))
             return true;
 
+        // The last look before sleeping: a block offered after it gets the reader a wake-up
+        if (!waiting.prepareToSleep())
+            return false;
+
 //        if (currentTimeSlice != null && currentTimeSlice.isCheckoutOnly(this)) {
 //            release(currentTimeSlice);
 //            currentTimeSlice = null;
@@ -297,7 +307,7 @@ public final class LiveDataReaderImpl
 
             // process waiting blocks (for live mode)
             for (;;) {
-                DataBlock block = pollWaiting();
+                DataBlock block = waiting.poll();
 
                 if (block == null)
                     break;
@@ -310,10 +320,6 @@ public final class LiveDataReaderImpl
 
             if (next != null) {
                 int state;
-
-                // TSFile already closed
-                if (!next.isActive())
-                    continue;
 
                 if (forward)
                     state = next.readMessageForward(processor);
@@ -383,30 +389,8 @@ public final class LiveDataReaderImpl
 
         super.asyncDataInserted(db, dataOffset, msgLength, timestamp);
 
-        offerWaiting(db);
-
-        notifier.submit();
-    }
-
-    private void                offerWaiting(DataBlock db) {
-        synchronized (waiting) {
-            int key = db.getEntity();
-            boolean added = waiting.put(key, db);
-            if (added) {
-                waitingList.add(key);
-            }
-        }
-    }
-
-    private DataBlock           pollWaiting() {
-        synchronized (waiting) {
-            if (waitingList.isEmpty()) {
-                return null;
-            }
-            int key = waitingList.pop();
-
-            return waiting.remove(key, null);
-        }
+        if (waiting.offer(db))
+            DeferredNotifications.submit(wakeUp);
     }
 
     private void              clearCurrent() {
@@ -415,32 +399,9 @@ public final class LiveDataReaderImpl
             pqIsLoaded = false;
         }
 
-        synchronized (waiting) {
-            clearWaiting();
-        }
+        waiting.clear();
 
         clearLinks();
-    }
-
-    /**
-     * Cleans "waiting" map.
-     */
-    @GuardedBy("waiting")
-    private void clearWaiting() {
-        int count = waitingList.size();
-        if (count * 16 < waiting.getCapacity()) {
-            // This means that map's hash table is sparse,
-            // and we can clean it faster by looking up individual keys instead of iterating over all entries.
-            while (!waitingList.isEmpty()) {
-                int key = waitingList.pop();
-                waiting.remove(key, null);
-            }
-            assert waiting.isEmpty();
-        } else {
-            // Use regular clear (iterates over all hash table cells, but this is faster when map is dense).
-            waiting.clear();
-        }
-        waitingList.clear();
     }
 
     @Override

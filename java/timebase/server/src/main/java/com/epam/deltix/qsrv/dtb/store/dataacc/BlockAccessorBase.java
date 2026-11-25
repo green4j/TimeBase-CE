@@ -113,6 +113,18 @@ abstract class BlockAccessorBase extends DataAccessorBase {
     }
     
     public final AccessorBlockLink     getBlockLink (int entity, long ffToTimestamp) {
+        AccessorBlockLink   link = getBlockLink (entity);
+
+        link.forward(ffToTimestamp);
+
+        return (link);
+    }
+
+    /**
+     * The link of the entity in the current time slice, without positioning it, so without taking
+     * the lock of the block.
+     */
+    final AccessorBlockLink            getBlockLink (int entity) {
         AccessorBlockLink   link;
 
         DataBlock           block = currentTimeSlice.getBlock (entity, true);
@@ -125,8 +137,6 @@ abstract class BlockAccessorBase extends DataAccessorBase {
                 links.put (entity, link);
             }
         }
-
-        link.forward(ffToTimestamp);
 
         return (link);
     }
